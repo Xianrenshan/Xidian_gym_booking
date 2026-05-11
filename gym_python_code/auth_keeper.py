@@ -12,14 +12,15 @@ import base64
 import logging
 from typing import Optional
 
-from playwright.sync_api import sync_playwright, BrowserContext
+from playwright.sync_api import sync_playwright
 import requests
 
 # ---------- 配置 ----------
-LOGIN_URL = "https://tybsouthgym.xidian.edu.cn/"          # 登录首页，可能会重定向到微信扫码页
-TEST_API_URL = "https://tybsouthgym.xidian.edu.cn/Field/GetFieldOrder?PageNum=1&PageSize=1"  # 用来刷新cookie的轻量接口
-STATE_FILE = "auth_state.json"                            # 保存浏览器长期状态的文件
-JWT_EXPIRE_BUFFER = 3 * 60                                # 在JWT过期前多少秒就主动刷新（秒）
+LOGIN_URL = "https://tybsouthgym.xidian.edu.cn/"            # 登录首页
+HOME_URL = "https://tybsouthgym.xidian.edu.cn/"             # 刷新会话时访问的首页
+TEST_API_URL = "https://tybsouthgym.xidian.edu.cn/Field/GetFieldOrder?PageNum=1&PageSize=1"   # 用于最终验证
+STATE_FILE = "auth_state.json"                              # 保存浏览器长期状态的文件
+JWT_EXPIRE_BUFFER = 3 * 60                                  # 在JWT过期前多少秒就主动刷新（秒）
 # --------------------------
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -89,32 +90,101 @@ class GymAuthKeeper:
         except Exception:
             return 0
 
-    # ---------- 获取有效Cookie ----------
     def get_valid_cookie(self) -> str:
-        """
-        对外接口：始终返回一个可直接用于请求头部的 Cookie 字符串。
-        内部会自动检测JWT是否即将过期，并通过已保存的状态刷新token。
-        """
         if self._state is None:
             self._load_state()
         if self._state is None:
             raise RuntimeError("没有可用的认证状态，请先执行 first_login()。")
 
-        # 使用保存的状态创建一个临时浏览器上下文，用来执行静默刷新
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)  # 后台静默运行，无需显示窗口
-            context = browser.new_context(storage_state=self._state)
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"]
+            )
+            context = browser.new_context(
+                storage_state=self._state,
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                        "Version/26.2 Safari/605.1.15"
+            )
             page = context.new_page()
 
-            # 访问一个需要登录的接口，触发服务器可能的Set-Cookie续期
-            logger.info("正在使用长期状态刷新短期token...")
-            try:
-                response = page.goto(TEST_API_URL, wait_until="domcontentloaded", timeout=15000)
-                page.wait_for_timeout(2000)  # 等待可能的异步js执行
-            except Exception as e:
-                logger.warning(f"刷新请求出现问题: {e}")
+            # 1. 访问首页
+            logger.info("正在访问首页...")
+            page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(2000)
 
-            # 重新提取所有cookie，并更新状态文件
+            # 2. 关闭弹窗（通用）
+            close_selectors = [
+                'button:has-text("关闭")', 'button:has-text("确定")',
+                'a:has-text("关闭")', 'span:has-text("关闭")',
+                '.layui-layer-close', '.dialog-close', '.close', '#close',
+                'button:has-text("×")', 'text=✕'
+            ]
+            for _ in range(3):
+                closed = False
+                for sel in close_selectors:
+                    try:
+                        el = page.locator(sel).first
+                        if el.count() > 0 and el.is_visible():
+                            el.click(timeout=2000)
+                            closed = True
+                            page.wait_for_timeout(1500)
+                            break
+                    except Exception:
+                        continue
+                if not closed:
+                    break
+
+            # 3. 点击“场地预订”
+            logger.info("点击‘场地预订’...")
+            try:
+                page.get_by_text("场地预订", exact=True).first.click(timeout=5000)
+            except Exception:
+                page.goto("https://tybsouthgym.xidian.edu.cn/Field/OrderField", wait_until="domcontentloaded")
+
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(3000)
+
+            # 4. 检查是否被重定向到用户类型选择页
+            page_title = page.title()
+            if "用户类型选择" in page_title or "用户类型" in page_title:
+                logger.info("检测到用户类型选择页面，正在处理...")
+                # 再次关闭可能遮罩的弹窗
+                page.wait_for_timeout(2000)
+                for sel in close_selectors:
+                    try:
+                        el = page.locator(sel).first
+                        if el.count() > 0 and el.is_visible():
+                            el.click(timeout=2000)
+                            page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
+
+                # 点击“校内用户”按钮（尝试多种定位）
+                page.wait_for_timeout(1000)
+                try:
+                    # 方法1：精确文本
+                    page.get_by_text("校内用户", exact=True).first.click(timeout=3000)
+                    logger.info("已点击‘校内用户’按钮")
+                except Exception:
+                    try:
+                        # 方法2：只包含“校内”
+                        page.get_by_text("校内", exact=False).first.click(timeout=3000)
+                        logger.info("已点击包含‘校内’的按钮")
+                    except Exception:
+                        # 方法3：通过 class 或 input 类型
+                        page.click('input[value*="校内"]', timeout=3000)
+                        logger.info("通过 input 点击了校内选项")
+                
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(3000)
+
+            # 5. 此时应该已经进入预订页面，再等一会儿确保 JWT 写入
+            page.wait_for_timeout(3000)
+
+            # 6. 保存最新状态
             new_state = context.storage_state()
             self._state = new_state
             with open(self.state_file, "w") as f:
@@ -122,29 +192,25 @@ class GymAuthKeeper:
 
             browser.close()
 
-        # 从状态文件中提取所有cookie，拼接成Cookie字符串
+        # 7. 提取 Cookie 并检查 JWT
         cookies = self._state.get("cookies", [])
         cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-        logger.debug(f"生成Cookie字符串，包含 {len(cookies)} 个cookie。")
 
-        # 额外检查JWT是否真的刷新了（如果存在JWTUserToken）
         jwt_token = None
         for c in cookies:
             if c["name"] == "JWTUserToken":
                 jwt_token = c["value"]
                 break
+
         if jwt_token:
             exp_time = self._decode_jwt_exp(jwt_token)
             if exp_time == 0:
-                logger.warning("无法解析JWT过期时间，Cookie可能无效。")
+                logger.warning("无法解析 JWT 过期时间")
             else:
                 remaining = exp_time - time.time()
-                if remaining < JWT_EXPIRE_BUFFER:
-                    logger.warning(f"JWT剩余时间仅 {remaining:.0f} 秒，但刷新后仍不足，请关注。")
-                else:
-                    logger.info(f"JWT有效，剩余 {remaining:.0f} 秒。")
+                logger.info(f"JWT 有效，剩余 {remaining:.0f} 秒")
         else:
-            logger.warning("未在Cookie中找到JWTUserToken，登录状态可能已失效！")
+            logger.warning("未找到 JWTUserToken，登录可能仍失效")
 
         return cookie_str
 
