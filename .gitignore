@@ -1,0 +1,11 @@
+code/
+code_opt/
+CV/
+auth_keeper.py
+auth_state.json
+test_gemini.py
+list_models.py
+auth_state.json
+test_nim_api.py
+yolov8n.pt
+code_opt.zip
