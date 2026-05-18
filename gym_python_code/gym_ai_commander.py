@@ -2,33 +2,38 @@ import json
 import os
 import time
 import threading
-import queue
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict
 
 from playwright.sync_api import sync_playwright
 import requests
 from openai import OpenAI
+from colorama import init, Fore, Style
+
+# 初始化终端颜色
+init(autoreset=True)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ============================================================================
-# ⚙️ 第一部分：系统与业务全局配置
+# ⚙️ [军规与配置] 物理法则与常数
 # ============================================================================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
 # --- 业务常量 ---
 LOGIN_URL = "https://tybsouthgym.xidian.edu.cn/"            
 HOME_URL = "https://tybsouthgym.xidian.edu.cn/"             
 BASE_URL = "https://tybsouthgym.xidian.edu.cn/Field/OrderField"
 ORDER_LIST_URL = "https://tybsouthgym.xidian.edu.cn/Field/GetFieldOrder"
 STATE_FILE = "auth_state.json"
-MEMORY_FILE = "battle_memory.txt"  # 🧠 大模型的隔日记忆文件
+MEMORY_FILE = "battle_memory.txt"
 
 DATE_ADD = 2
 PRICE = "2.00"
 TARGET_TIME = {"begin": "14:00", "end": "17:00"}
-MAX_TOTAL_THREADS = 12 # 系统允许的最大总并发兵力
+ALL_FIELDS = [f"JSP{i:03d}" for i in range(1, 41)] # 全量目标场地 JSP001-JSP040
+
+# --- 物理风控法则 ---
+SNIPER_COOLDOWN = 3.1  # 主炮绝对冷却时间 (秒)
+SCOUT_INTERVAL = 1.0   # 侦察无人机轮询时间 (秒)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
@@ -37,433 +42,333 @@ HEADERS = {
     "Connection": "keep-alive"
 }
 
-# --- AI 指挥官配置 ---
-LLM_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx" # 填入你的大模型API Key
+# --- AI 将军配置 ---
+LLM_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxx" # 【填入你的API KEY】
 LLM_BASE_URL = "https://api.deepseek.com/v1" 
 LLM_MODEL = "deepseek-chat"
-
 client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
+# 全局信号与共享弹药
 GLOBAL_COOKIE = ""
-FIRE_EVENT = threading.Event() # 12:00:00 开火的全局信号枪
+VICTORY_FLAG = threading.Event() 
+FIRE_EVENT = threading.Event() 
 
 
 # ============================================================================
-# 🛡️ 第二部分：后勤保障部队 (Playwright 提取 Cookie)
+# 🛡️ [后勤部队] Cookie 保活与防封机制 (Playwright)
 # ============================================================================
-class GymAuthKeeper:
-    def __init__(self, state_file: str = STATE_FILE):
+class LogisticsKeeper:
+    def __init__(self, state_file=STATE_FILE):
         self.state_file = state_file
         self._state = None
 
-    def first_login(self) -> None:
-        logger.info("启动浏览器进行首次登录...")
+    def first_login(self):
+        print(Fore.CYAN + "🛠️ [后勤兵] 启动首次认证流程，请在弹出的浏览器中扫码...")
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False, args=["--disable-blink-features=AutomationControlled"])
-            context = browser.new_context(viewport={"width": 1280, "height": 720}, user_agent=HEADERS["User-Agent"])
+            browser = p.chromium.launch(headless=False)
+            context = browser.new_context(user_agent=HEADERS["User-Agent"])
             page = context.new_page()
-            page.goto(LOGIN_URL, wait_until="domcontentloaded")
-
-            print("\n" + "=" * 50)
-            print("请在浏览器中用微信扫码登录。登录成功（跳转到预约界面）后，按回车键继续...")
-            print("=" * 50 + "\n")
-            input(">> 按回车确认登录完成 <<")
-
+            page.goto(LOGIN_URL)
+            input(Fore.YELLOW + ">> 扫码成功并跳转后，在此按回车键保存合法身份 <<")
             context.storage_state(path=self.state_file)
             browser.close()
-        self._load_state()
-
-    def _load_state(self) -> Optional[dict]:
-        if os.path.exists(self.state_file):
-            with open(self.state_file, "r") as f:
-                self._state = json.load(f)
-            return self._state
-        return None
 
     def get_valid_cookie(self) -> str:
-        if self._state is None and self._load_state() is None:
-            raise RuntimeError("无可用认证状态，请先执行首次登录。")
+        if not os.path.exists(self.state_file):
+            self.first_login()
+        with open(self.state_file, "r") as f:
+            self._state = json.load(f)
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+            browser = p.chromium.launch(headless=True)
             context = browser.new_context(storage_state=self._state, user_agent=HEADERS["User-Agent"])
             page = context.new_page()
-            
             page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_load_state("networkidle")
             page.wait_for_timeout(2000)
 
-            for sel in ['.layui-layer-close', '.dialog-close', '.close', '#close', 'button:has-text("关闭")', 'button:has-text("×")']:
+            for sel in ['.layui-layer-close', '.dialog-close', 'button:has-text("关闭")']:
                 try:
                     el = page.locator(sel).first
-                    if el.count() > 0 and el.is_visible():
-                        el.click(timeout=1000)
-                except:
-                    continue
+                    if el.is_visible(): el.click(timeout=1000)
+                except: pass
 
             new_state = context.storage_state()
-            self._state = new_state
             with open(self.state_file, "w") as f:
                 json.dump(new_state, f)
             browser.close()
 
-        cookies = self._state.get("cookies", [])
+        cookies = new_state.get("cookies", [])
         return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-auth_keeper = GymAuthKeeper()
-
 
 # ============================================================================
-# 🧠 第三部分：全局战术沙盘 (State) & 兵力微操控制器
+# 🗺️ [战争沙盘] Battlefield State (世界模型)
 # ============================================================================
-class BattleState:
+class BattlefieldState:
     def __init__(self):
         self.lock = threading.Lock()
-        self.is_victory = False
-        self.auth_status = "VALID"
+        self.shot_history = []  # 记录最近10枪战果
+        self.field_state = {f: {"status": "UNKNOWN", "heat": 0.0, "dead_count": 0} for f in ALL_FIELDS}
+        self.waf_strikes = 0
         
-        # 记录场地的战况特征 (供大模型推演)
-        self.fields_intel = {} 
-        
-        # 动态兵力与油门控制器
-        # 结构: {"JSP031": {"delay_ms": 500, "threads": [stop_event_1, stop_event_2]}}
-        self.troops_config = {}
-
-    def update_field_intel(self, field_no, status, msg=""):
+    def update_shot_result(self, target: str, semantic_result: str):
         with self.lock:
-            if field_no not in self.fields_intel:
-                self.fields_intel[field_no] = {"status": "IDLE", "msg": msg, "fails": 0}
-            self.fields_intel[field_no]["status"] = status
-            self.fields_intel[field_no]["msg"] = msg
-            if status in ["DEAD", "WAF_BLOCK"]:
-                self.fields_intel[field_no]["fails"] += 1
+            # 记录历史
+            self.shot_history.insert(0, {"time": datetime.now().strftime("%H:%M:%S"), "target": target, "result": semantic_result})
+            if len(self.shot_history) > 10:
+                self.shot_history.pop()
+                
+            # 更新场地状态
+            self.field_state[target]["status"] = semantic_result
+            if semantic_result == "DEAD":
+                self.field_state[target]["dead_count"] += 1
+            elif semantic_result == "WAF":
+                self.waf_strikes += 1
 
-    def get_summary(self):
-        """生成供大模型决策的态势感知 JSON"""
+    def get_sandbox_json(self):
         with self.lock:
-            deployment_summary = {}
-            for field, conf in self.troops_config.items():
-                active_count = len([e for e in conf["threads"] if not e.is_set()])
-                if active_count > 0:
-                    deployment_summary[field] = {"active_threads": active_count, "delay_ms": conf["delay_ms"]}
-            
+            # 只提取非 UNKNOWN 的场地发给 AI，节省 Token
+            active_fields = {k: v for k, v in self.field_state.items() if v["status"] != "UNKNOWN"}
             return json.dumps({
-                "time": datetime.now().strftime('%H:%M:%S'),
-                "auth_status": self.auth_status,
-                "current_deployments": deployment_summary,
-                "fields_intel": self.fields_intel
+                "waf_level": self.waf_strikes,
+                "recent_shots": self.shot_history[:5],
+                "known_fields": active_fields
             }, ensure_ascii=False)
 
-state = BattleState()
-event_bus = queue.Queue()
+sandbox = BattlefieldState()
 
 
 # ============================================================================
-# ⚔️ 第四部分：前线肌肉部队 (动态油门刺客 & 侦察兵)
+# 🧠 [AI 参谋部] OODA 推演与战术下达
 # ============================================================================
-def killer_worker(field_no, stop_event, config_dict):
-    """【刺客线程】遵守指挥官下发的 delay_ms，并在 12:00:00 统一开火"""
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    
-    item = {"FieldNo": field_no, "FieldTypeNo": "006", "BeginTime": TARGET_TIME["begin"], "Endtime": TARGET_TIME["end"], "Price": PRICE}
-    params = {"checkdata": json.dumps([item], ensure_ascii=False), "dateadd": DATE_ADD, "VenueNo": "01"}
+class AICommander:
+    def __init__(self):
+        self.memory = self._load_memory()
+        
+    def _load_memory(self):
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                return f.read()[-1000:] # 只读最近的记忆
+        return "无先验记忆。常识：30-40为红海热门，15-25为中区盲区。"
 
-    # 等待全局发令枪 (12:00:00)
-    FIRE_EVENT.wait()
-    event_bus.put({"type": "DEPLOYED", "field": field_no, "msg": f"刺客开火!"})
-
-    while not stop_event.is_set() and not state.is_victory:
-        session.headers.update({"Cookie": GLOBAL_COOKIE})
-        try:
-            resp = session.get(BASE_URL, params=params, timeout=10)
-            res_text = resp.text
-
-            if "人数过多" in res_text:
-                event_bus.put({"type": "WAF_BLOCK", "field": field_no, "msg": "被Nginx阻挡"})
-            elif "已被" in res_text or "已满" in res_text or "被其他人" in res_text:
-                event_bus.put({"type": "DEAD", "field": field_no, "msg": "已被抢跑，阵亡"})
-                break 
-            elif "未登录" in res_text or "重新登录" in res_text:
-                event_bus.put({"type": "AUTH_FAILED", "field": field_no, "msg": "401未登录"})
-                time.sleep(3)
-            elif "成功" in res_text:
-                event_bus.put({"type": "VICTORY", "field": field_no, "msg": "疑似成功！"})
-                break
-            else:
-                event_bus.put({"type": "UNKNOWN", "field": field_no, "msg": "未知返回结果"})
-                
-        except requests.exceptions.ReadTimeout:
-            event_bus.put({"type": "PENDING", "field": field_no, "msg": "超时阻塞(极可能排队成功)"})
-        except Exception as e:
-            event_bus.put({"type": "ERROR", "field": field_no, "msg": str(e)[:20]})
-            
-        # ⚠️ 动态油门：大模型随时会修改 config_dict["delay_ms"]
-        current_delay = config_dict.get("delay_ms", 1000) / 1000.0
-        time.sleep(current_delay)
-
-def scout_worker():
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    FIRE_EVENT.wait() # 12:00 准时升空
-    
-    while not state.is_victory:
-        session.headers.update({"Cookie": GLOBAL_COOKIE})
-        try:
-            resp = session.get(ORDER_LIST_URL, params={"PageNum": 1, "PageSize": 5, "Condition": ""}, timeout=5)
-            if resp.status_code == 200:
-                orders = resp.json().get("datatable", [])
-                for o in orders:
-                    field_name = o.get("Field", "")
-                    left_time = int(o.get("LeftTime", 0))
-                    if "健身房" in field_name and left_time > 0:
-                        event_bus.put({"type": "VICTORY", "field": field_name, "msg": f"订单生成！剩 {left_time}s 付款"})
-                        return
-        except: pass
-        time.sleep(2.5)
-
-def emergency_cookie_refresh():
-    global GLOBAL_COOKIE
-    try:
-        GLOBAL_COOKIE = auth_keeper.get_valid_cookie()
-        state.auth_status = "VALID"
-        print("✅ [后勤情报] Cookie 紧急补充完毕！")
-    except Exception as e:
-        state.auth_status = "INVALID"
-
-
-# ============================================================================
-# 📡 第五部分：雷达总线枢纽 (更新战况)
-# ============================================================================
-def radar_event_loop():
-    while not state.is_victory:
-        try:
-            event = event_bus.get(timeout=1)
-            e_type, field, msg = event.get("type"), event.get("field"), event.get("msg")
-            
-            if e_type == "VICTORY":
-                state.is_victory = True
-                print(f"\n🏆🏆🏆 战报：{msg} 🏆🏆🏆\n")
-                continue
-
-            if e_type == "AUTH_FAILED" and state.auth_status != "RECOVERING":
-                state.auth_status = "RECOVERING"
-                print("🚨 发现 Session 断开！紧急抢修...")
-                threading.Thread(target=emergency_cookie_refresh, daemon=True).start()
-
-            state.update_field_intel(field, e_type, msg)
-            color = "🔴" if e_type in ["DEAD", "WAF_BLOCK", "AUTH_FAILED"] else "🟡" if e_type == "PENDING" else "🔵"
-            print(f"{color} [{datetime.now().strftime('%H:%M:%S')}] {field} -> {e_type}: {msg}")
-        except queue.Empty:
-            pass
-
-
-# ============================================================================
-# 🤖 第六部分：LLM 大脑指挥系统 (规划、微操、复盘)
-# ============================================================================
-# 工具定义：统一的兵力微操工具
-LLM_TOOLS = [{
-    "type": "function",
-    "function": {
-        "name": "update_battle_plan",
-        "description": "调整战术部署：分配目标场地、兵力(线程数)和攻击油门(delay_ms)。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "deployments": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "field_no": {"type": "string", "description": "场地编号(如 JSP031)"},
-                            "thread_count": {"type": "integer", "description": "分配兵力，0表示撤军"},
-                            "delay_ms": {"type": "integer", "description": "请求间隔毫秒数(油门控制)"}
-                        }
-                    }
-                },
-                "reason": {"type": "string", "description": "战术调整理由"}
-            },
-            "required": ["deployments", "reason"]
-        }
-    }
-}]
-
-def execute_tactical_command(deployments, reason):
-    """【微操执行官】动态增删线程，修改休眠间隔"""
-    print(f"\n🧠 [指挥官决断] 理由：{reason}")
-    with state.lock:
-        total_requested = sum([d["thread_count"] for d in deployments])
-        if total_requested > MAX_TOTAL_THREADS:
-            print(f"⚠️ 警告：指挥官要求的兵力({total_requested})超过限制({MAX_TOTAL_THREADS})，系统强制拦截！")
-            return
-
-        for cmd in deployments:
-            field = cmd["field_no"]
-            target_threads = cmd["thread_count"]
-            delay_ms = cmd["delay_ms"]
-            
-            # 初始化场地的配置字典
-            if field not in state.troops_config:
-                state.troops_config[field] = {"delay_ms": delay_ms, "threads": []}
-            
-            # 1. 动态调节油门
-            state.troops_config[field]["delay_ms"] = delay_ms
-            
-            # 2. 动态调节兵力
-            current_threads = state.troops_config[field]["threads"]
-            active_events = [e for e in current_threads if not e.is_set()]
-            current_count = len(active_events)
-            
-            if target_threads > current_count:
-                # 增兵
-                diff = target_threads - current_count
-                print(f"    🚀 增兵指令: [{field}] 新增 {diff} 个刺客，油门 {delay_ms}ms")
-                for _ in range(diff):
-                    stop_evt = threading.Event()
-                    t = threading.Thread(target=killer_worker, args=(field, stop_evt, state.troops_config[field]))
-                    t.daemon = True
-                    t.start()
-                    state.troops_config[field]["threads"].append(stop_evt)
-            elif target_threads < current_count:
-                # 裁军
-                diff = current_count - target_threads
-                print(f"    🚫 撤退指令: [{field}] 撤回 {diff} 个刺客")
-                for e in active_events[:diff]:
-                    e.set()
-
-def read_memory():
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            return f.read()
-    return "无历史作战记录。"
-
-def ai_drafting_phase():
-    """战前推演：大模型根据隔日记忆，制定初始排兵布阵"""
-    memory = read_memory()
-    print("\n🧠 [AI 战前推演室] 正在读取《历史战役日记》...")
-    
-    sys_prompt = f"""你是一位天才战术指挥官。任务：抢占校园健身房(场地编号:JSP001 到 JSP040)。
-    【昨日历史日记】：
-    {memory}
-    
-    【任务】：
-    1. 结合历史经验、人类心理学（人们倾向抢首尾，中间可能没人抢），制定首批攻击目标。
-    2. 总兵力必须小于 {MAX_TOTAL_THREADS}。
-    3. 热门场地可以给 2-3 个线程并发，冷门场地 1 个线程捡漏。
-    4. 初始请求间隔(delay_ms)建议设为 1000ms-2000ms 防止刚开局就被封。
-    5. 调用 update_battle_plan 下发布署。
-    """
-    
-    res = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[{"role": "system", "content": sys_prompt}],
-        tools=LLM_TOOLS,
-        tool_choice={"type": "function", "function": {"name": "update_battle_plan"}}
-    )
-    msg = res.choices[0].message
-    if msg.tool_calls:
-        args = json.loads(msg.tool_calls[0].function.arguments)
-        execute_tactical_command(args.get("deployments", []), args.get("reason", "首发阵型"))
-
-def ai_mid_battle_loop():
-    """战中微操：动态油门与换防"""
-    sys_prompt = """你是战中微操指挥官。每4秒查看一次雷达。
-    1. 若场地 DEAD(阵亡)，立刻设其兵力为 0，并将兵力转移至 JSP001-JSP040 中的冷门随机场地捡漏。
-    2. 若场地 PENDING(超时排队)，【绝对不要撤军】，那是马上成功的征兆！
-    3. 若连续 WAF_BLOCK，将该场地兵力减至1，且 delay_ms 调大至 3000ms，静默规避风控。
-    4. 必须调用 update_battle_plan。"""
-
-    while not state.is_victory:
-        time.sleep(4)
-        if state.auth_status != "VALID": continue
+    def draft_opening_target(self) -> str:
+        """战前推演 (Phase 0)"""
+        sys_prompt = f"""你是战场指挥官。你要决定12:00:00开闸后的第一枪打哪个场地。
+        可选范围: JSP001 到 JSP040。
+        【历史记忆】：{self.memory}
+        请直接输出一个你认为最有战略意义的场地编号（如 JSP031 或 JSP018）。只输出编号，不要废话。"""
         
         try:
             res = client.chat.completions.create(
                 model=LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": state.get_summary()}
-                ],
-                tools=LLM_TOOLS,
-                tool_choice="auto",
-                timeout=12
+                messages=[{"role": "system", "content": sys_prompt}]
             )
-            msg = res.choices[0].message
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    if tc.function.name == "update_battle_plan":
-                        args = json.loads(tc.function.arguments)
-                        execute_tactical_command(args.get("deployments", []), args.get("reason", ""))
-        except Exception as e:
-            print(f"⚠️ AI 参谋部通讯异常: {e}")
+            target = res.choices[0].message.content.strip().upper()
+            if target in ALL_FIELDS:
+                return target
+        except: pass
+        return "JSP031" # 降级默认
 
-def ai_post_battle_summary():
-    """赛后复盘：总结经验写入日记，实现隔日进化"""
-    print("\n🧠 [AI 赛后复盘室] 战斗结束，正在分析战损，撰写战役日记...")
-    report = state.get_summary()
-    
-    sys_prompt = """战斗已结束。你作为指挥官，需要结合战报总结一条 50 字以内的短经验。
-    例如指出：哪个场地神仙打架、哪个场地容易捡漏、WAF风控严不严。
-    你的回复将直接存入记忆文件，供明天的你读取。直接输出经验文字，不要任何多余废话。"""
-    
-    try:
-        res = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": f"今日战果及雷达大盘：{report}"}
-            ]
-        )
-        summary = res.choices[0].message.content.strip()
-        print(f"📝 获得新进化经验：{summary}")
+    def decide_next_target(self, current_target: str, html_text: str) -> dict:
+        """核心 OODA Loop 决策大脑 (Phase 3)"""
+        # 1. 规则引擎翻译前端结果 (Semantic Parser)
+        semantic_result = "UNKNOWN"
+        if "已满" in html_text or "已被" in html_text or "其他人" in html_text:
+            semantic_result = "DEAD"
+        elif "成功" in html_text or "待支付" in html_text:
+            semantic_result = "SUCCESS"
+        elif "频繁" in html_text or "人数过多" in html_text:
+            semantic_result = "WAF"
+        elif "timeout" in html_text.lower():
+            semantic_result = "TIMEOUT"
+
+        # 更新世界沙盘
+        sandbox.update_shot_result(current_target, semantic_result)
         
-        with open(MEMORY_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {summary}\n")
-    except Exception as e:
-        print("写入记忆失败", e)
+        # 终端播报
+        color = Fore.RED if semantic_result in ["DEAD", "WAF"] else Fore.YELLOW if semantic_result == "TIMEOUT" else Fore.GREEN
+        print(f"🎯 [狙击手报告] 目标 {current_target} -> {color}{semantic_result}{Style.RESET_ALL}")
+
+        # 2. 如果这枪打成了，终止思考
+        if semantic_result == "SUCCESS":
+            return {"target": current_target, "strategy": "VICTORY", "reason": "疑似命中"}
+
+        # 3. 呼叫大模型将军进行战术推演
+        state_json = sandbox.get_sandbox_json()
+        sys_prompt = f"""你是抢票赛博将军。每次只能打一枪，冷却 3 秒。
+        当前世界沙盘状态：{state_json}
+        【将军权限与战略模式】：
+        1. HOT_ZONE_BLITZ (死磕头尾热门区 30-40, 1-5)
+        2. MID_ZONE_SWEEP (转战中区盲区 15-25)
+        3. STICKY_ATTACK (发现 TIMEOUT 时，你有权下令继续赌同一个场地)
+        
+        【强制约束】：
+        1. 返回 JSON 格式。包含 "strategy", "next_target" (必须是 JSP001-JSP040), "reason"。
+        2. 极力避免安排打状态已是 DEAD 的场地。
+        """
+
+        try:
+            res = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "system", "content": sys_prompt}],
+                response_format={"type": "json_object"},
+                timeout=2.0 # 必须在冷却时间(3.1s)内想完！
+            )
+            decision = json.loads(res.choices[0].message.content)
+            return decision
+        except Exception as e:
+            # 降级护栏：如果 AI 超时或崩溃，盲退一格
+            idx = ALL_FIELDS.index(current_target)
+            safe_target = ALL_FIELDS[max(0, idx - 1)]
+            return {"next_target": safe_target, "strategy": "DEGRADED_FALLBACK", "reason": "参谋部通讯中断，机械后撤"}
+
+    def write_post_battle_memory(self):
+        """战后复盘，写入记忆"""
+        print(Fore.CYAN + "\n🧠 [参谋部] 战斗结束。正在撰写《战役回忆录》...")
+        sys_prompt = f"""分析以下今日战局沙盘，输出一句话的核心经验，指导明天的首发策略。
+        {sandbox.get_sandbox_json()}"""
+        try:
+            res = client.chat.completions.create(model=LLM_MODEL, messages=[{"role": "system", "content": sys_prompt}])
+            summary = res.choices[0].message.content.strip()
+            with open(MEMORY_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().strftime('%Y-%m-%d')}] {summary}\n")
+            print(Fore.MAGENTA + f"📜 记忆已烙印: {summary}")
+        except: pass
 
 
 # ============================================================================
-# 🏁 第七部分：主战场入口
+# 🚁 [侦察无人机] 不受限频控制的订单嗅探器 (Scout Drone)
+# ============================================================================
+def scout_drone_worker():
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    FIRE_EVENT.wait()
+    print(Fore.CYAN + "🚁 [侦察机] 已升空，开始高频扫描战损订单...")
+    
+    while not VICTORY_FLAG.is_set():
+        session.headers.update({"Cookie": GLOBAL_COOKIE})
+        try:
+            resp = session.get(ORDER_LIST_URL, params={"PageNum": 1, "PageSize": 5, "Condition": ""}, timeout=4)
+            if resp.status_code == 200:
+                orders = resp.json().get("datatable", [])
+                for o in orders:
+                    if "健身房" in o.get("Field", "") and int(o.get("LeftTime", 0)) > 0:
+                        print(Fore.GREEN + f"\n🏆🏆🏆 [最高捷报] 截获待支付订单: 【{o['Field']}】 剩余时间: {o['LeftTime']}s 🏆🏆🏆\n")
+                        VICTORY_FLAG.set() # 强制全局胜利
+                        return
+        except: pass
+        time.sleep(SCOUT_INTERVAL) # 高频侦察，不受主炮 3 秒限制
+
+
+# ============================================================================
+# ⚔️ [战地引擎] 严格 3 秒回合作战 (Battle Engine)
+# ============================================================================
+def tactical_guardrail(ai_target: str, current_target: str) -> str:
+    """人类硬规则保底防抽风"""
+    if ai_target not in ALL_FIELDS:
+        return current_target
+    # 如果 AI 执意要打已经死了 2 次以上的场地，强制干预
+    if sandbox.field_state.get(ai_target, {}).get("dead_count", 0) >= 2:
+        print(Fore.YELLOW + "⚠️ [护栏拦截] AI 指令疯狂。目标已被鞭尸多次，强制跳过。")
+        idx = ALL_FIELDS.index(ai_target)
+        return ALL_FIELDS[max(0, idx - 1)]
+    return ai_target
+
+def battle_engine_loop(ai: AICommander, initial_target: str):
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    
+    current_target = initial_target
+    last_shot_time = 0.0
+
+    FIRE_EVENT.wait()
+    
+    while not VICTORY_FLAG.is_set():
+        # --- ⏳ Phase 1: 绝对物理冷却 (GCD) ---
+        now = time.perf_counter()
+        elapsed = now - last_shot_time
+        if elapsed < SNIPER_COOLDOWN:
+            time.sleep(SNIPER_COOLDOWN - elapsed)
+        
+        # --- 🔫 Phase 2: Act (士兵开火) ---
+        session.headers.update({"Cookie": GLOBAL_COOKIE})
+        item = {"FieldNo": current_target, "FieldTypeNo": "006", "BeginTime": TARGET_TIME["begin"], "Endtime": TARGET_TIME["end"], "Price": PRICE}
+        params = {"checkdata": json.dumps([item], ensure_ascii=False), "dateadd": DATE_ADD, "VenueNo": "01"}
+        
+        html_text = ""
+        try:
+            resp = session.get(BASE_URL, params=params, timeout=10) # Timeout 设长，容忍锁库存现象
+            html_text = resp.text
+        except requests.exceptions.ReadTimeout:
+            html_text = "timeout"
+        except Exception as e:
+            html_text = "waf_or_error"
+            
+        last_shot_time = time.perf_counter()
+
+        # --- 🧠 Phase 3: Observe & Orient & Decide (AI 思考下一回合) ---
+        # 士兵处于冷却退弹壳期，将军同步进行思考，完美压榨时间
+        decision = ai.decide_next_target(current_target, html_text)
+        
+        if VICTORY_FLAG.is_set(): 
+            break
+            
+        ai_next = decision.get("next_target", current_target)
+        strategy = decision.get("strategy", "UNKNOWN")
+        reason = decision.get("reason", "无可奉告")
+
+        print(Fore.MAGENTA + f"🧠 [指挥官] 策略: {strategy} | 下一枪: {ai_next} | 逻辑: {reason}")
+        
+        # --- 🛡️ Phase 4: Guardrail (护栏兜底) ---
+        current_target = tactical_guardrail(ai_next, current_target)
+
+
+# ============================================================================
+# 🏁 统帅部入口
 # ============================================================================
 def start_war():
     global GLOBAL_COOKIE
-    print("\n" + "="*50)
-    print("====== 🌟 AI 驱动体育馆抢票智能体系统 (V3 赛博进化版) 🌟 ======")
-    
-    # 1. 战前筹备
-    if not os.path.exists(STATE_FILE):
-        auth_keeper.first_login()
-    GLOBAL_COOKIE = auth_keeper.get_valid_cookie()
-    print("✅ 后勤保障就绪！")
+    print(Fore.WHITE + "="*60)
+    print(Fore.CYAN + "   🤖 OODA Turn-Based AI Cyber Commander (v1.0 冻结版)")
+    print(Fore.WHITE + "="*60)
 
-    # 2. 雷达兵与侦察兵上线
-    threading.Thread(target=radar_event_loop, daemon=True).start()
-    threading.Thread(target=scout_worker, daemon=True).start()
+    # 1. 后勤整备
+    logistics = LogisticsKeeper()
+    GLOBAL_COOKIE = logistics.get_valid_cookie()
+    print(Fore.GREEN + "✅ [后勤] 粮草充足，合法 Cookie 已装配。")
 
-    # 3. 战前推演 (大脑根据日记制定阵型)
-    ai_drafting_phase()
+    # 2. 唤醒将军，制定首发盲盒
+    ai = AICommander()
+    initial_target = ai.draft_opening_target()
+    print(Fore.MAGENTA + f"🧠 [战前推演] 将军指示首发目标瞄准：{initial_target}")
 
-    # 4. 精准打击准备
-    print("\n⏳ 所有兵力潜伏就绪，等待 12:00:00 发令枪...")
+    # 3. 部署无人侦察机
+    threading.Thread(target=scout_drone_worker, daemon=True).start()
+
+    # 4. 卡点等待
+    print(Fore.YELLOW + "⏳ 主炮上膛，静息伪装，等待 12:00:00 时钟溢出...")
     while True:
-        now = datetime.now()
-        if now.hour >= 12: # 测试时可改为 now.minute >= x
+        if datetime.now().hour >= 12:  # 测试可改为 .minute >= xx
             break
         time.sleep(0.01)
 
-    print(f"\n💥 【{datetime.now().strftime('%H:%M:%S.%f')[:-3]}】 门已开！全军出击！")
-    FIRE_EVENT.set() # 释放信号枪，所有阻塞的刺客瞬间开火
+    print(Fore.RED + f"\n💥💥💥 【{datetime.now().strftime('%H:%M:%S.%f')[:-3]}】 闸门大开！战争开始！ 💥💥💥\n")
+    FIRE_EVENT.set() # 全局发令枪
 
-    # 5. 移交微操指挥权
-    ai_mid_battle_loop()
+    # 5. 进入回合制交火死循环
+    try:
+        battle_engine_loop(ai, initial_target)
+    except KeyboardInterrupt:
+        print(Fore.YELLOW + "\n⚠️ 人类强制终止了战争。")
 
-    # 6. 赛后复盘 (记录进本地知识库)
-    ai_post_battle_summary()
-    print("\n🎉🎉🎉 系统运行结束。干得漂亮，指挥官。 🎉🎉🎉\n")
+    # 6. 打扫战场，记忆进化
+    if VICTORY_FLAG.is_set():
+        print(Fore.GREEN + "🏆 战争以人类的胜利告终，请速归微信支付。")
+    ai.write_post_battle_memory()
+
 
 if __name__ == "__main__":
     if "xxxxxxxxxxxx" in LLM_API_KEY:
-        print("❌ 严重错误：请先在脚本顶部配置大模型的 LLM_API_KEY！")
+        print(Fore.RED + "❌ 致命错误：大模型 API_KEY 缺失！将导致指挥部无法连线。")
     else:
         start_war()
